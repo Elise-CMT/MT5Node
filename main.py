@@ -131,6 +131,40 @@ class AccountsPayload(BaseModel):
         return v
 
 
+class Deal(BaseModel):
+    ticket: int
+    order: int
+    position_id: int
+    login: int
+    symbol: str
+    action: int          # 0=BUY 1=SELL 2=BALANCE etc.
+    entry: int           # 0=IN 1=OUT 2=INOUT 3=OUT_BY
+    price: float
+    price_sl: float
+    price_tp: float
+    volume_lots: float
+    volume_closed_lots: float
+    profit: float
+    commission: float
+    swap: float
+    fee: float
+    reason: int
+    time: int            # Unix timestamp (seconds)
+    time_msc: int        # Unix timestamp (milliseconds)
+    comment: str = ""
+
+
+class DealsPayload(BaseModel):
+    deals: list[Deal]
+
+    @field_validator("deals")
+    @classmethod
+    def must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError("deals array must not be empty")
+        return v
+
+
 # =============================================================================
 # Health
 # =============================================================================
@@ -267,4 +301,71 @@ def get_account(login: int):
     data = r.get(f"account:{login}")
     if data is None:
         raise HTTPException(status_code=404, detail=f"Account {login} not found")
+    return json.loads(data)
+
+
+# =============================================================================
+# Deals endpoints
+# =============================================================================
+
+@app.post("/deals", dependencies=[Security(verify_token)])
+def post_deals(payload: DealsPayload):
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+
+    pipe = r.pipeline()
+    pipe.set("deals:last_update", now)
+    for deal in payload.deals:
+        pipe.set(f"deal:{deal.ticket}", json.dumps(deal.model_dump()))
+        pipe.sadd("deals:tickets", str(deal.ticket))
+    pipe.execute()
+
+    return {
+        "success": True,
+        "deals_processed": len(payload.deals),
+        "tickets": [d.ticket for d in payload.deals],
+    }
+
+
+@app.get("/deals", dependencies=[Security(verify_token)])
+def get_all_deals():
+    r = get_redis()
+    tickets = list(r.smembers("deals:tickets"))
+    if not tickets:
+        return {"count": 0, "deals": []}
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deal:{t}")
+    deals = sorted(
+        [json.loads(d) for d in pipe.execute() if d],
+        key=lambda d: d["time"],
+        reverse=True,
+    )
+    return {"count": len(deals), "deals": deals}
+
+
+@app.get("/deals/latest", dependencies=[Security(verify_token)])
+def get_deals_latest():
+    r = get_redis()
+    last_update = r.get("deals:last_update")
+    if last_update is None:
+        raise HTTPException(status_code=404, detail="No deals stored yet")
+    tickets = list(r.smembers("deals:tickets"))
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deal:{t}")
+    deals = sorted(
+        [json.loads(d) for d in pipe.execute() if d],
+        key=lambda d: d["time"],
+        reverse=True,
+    )
+    return {"last_update": last_update, "count": len(deals), "deals": deals[:100]}
+
+
+@app.get("/deals/{ticket}", dependencies=[Security(verify_token)])
+def get_deal(ticket: int):
+    r = get_redis()
+    data = r.get(f"deal:{ticket}")
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Deal {ticket} not found")
     return json.loads(data)
