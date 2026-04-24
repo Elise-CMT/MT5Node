@@ -1,41 +1,18 @@
-import gzip
 import json
 import os
 from datetime import datetime, timezone
 
 import redis
-from fastapi import FastAPI, HTTPException, Request, Security
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.gzip import GZipMiddleware
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 API_PORT   = int(os.environ.get("API_PORT", 8080))
 API_TOKEN  = os.environ.get("API_TOKEN", "f118da769ab686ae753192d548f67a3a371904b9d805f4c8fef293cda884fc7f")
 
-app  = FastAPI(title="MT5 Poller API")
-
-# Compress all responses automatically
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-# Decompress gzip-encoded request bodies transparently
-class GzipRequestMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.headers.get("Content-Encoding", "").lower() == "gzip":
-            try:
-                body = await request.body()
-                decompressed = gzip.decompress(body)
-                async def receive():
-                    return {"type": "http.request", "body": decompressed, "more_body": False}
-                request._receive = receive
-            except Exception as exc:
-                return JSONResponse({"error": f"gzip decompress failed: {exc}"}, status_code=400)
-        return await call_next(request)
-
-app.add_middleware(GzipRequestMiddleware)
+app = FastAPI(title="MT5 Poller API")
 
 pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 bearer = HTTPBearer()
