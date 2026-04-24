@@ -185,10 +185,25 @@ def health():
 
 @app.post("/positions", dependencies=[Security(verify_token)])
 def post_positions(payload: PositionsPayload):
+    """
+    Atomic snapshot replace: old position keys are deleted before storing
+    the new batch, so closed positions never linger in Redis.
+    """
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
+    new_tickets = {str(p.ticket) for p in payload.positions}
+
+    # Collect stale tickets that are no longer in the new snapshot
+    old_tickets = r.smembers("positions:tickets") or set()
+    stale = old_tickets - new_tickets
 
     pipe = r.pipeline()
+    # Remove stale individual keys
+    for t in stale:
+        pipe.delete(f"position:{t}")
+    # Replace the tickets set entirely
+    pipe.delete("positions:tickets")
+    # Write new snapshot
     pipe.set("positions:latest:raw", payload.model_dump_json())
     pipe.set("positions:last_update", now)
     for pos in payload.positions:
@@ -200,6 +215,7 @@ def post_positions(payload: PositionsPayload):
         "success": True,
         "positions_processed": len(payload.positions),
         "tickets": [p.ticket for p in payload.positions],
+        "stale_removed": len(stale),
     }
 
 
@@ -243,10 +259,21 @@ def get_all_positions():
 
 @app.post("/accounts", dependencies=[Security(verify_token)])
 def post_accounts(payload: AccountsPayload):
+    """
+    Atomic snapshot replace: accounts no longer present in the group
+    (e.g. moved to a different group) are removed from Redis.
+    """
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
+    new_logins = {str(a.login) for a in payload.accounts}
+
+    old_logins = r.smembers("accounts:logins") or set()
+    stale = old_logins - new_logins
 
     pipe = r.pipeline()
+    for lg in stale:
+        pipe.delete(f"account:{lg}")
+    pipe.delete("accounts:logins")
     pipe.set("accounts:latest:raw", payload.model_dump_json())
     pipe.set("accounts:last_update", now)
     for acct in payload.accounts:
@@ -258,6 +285,7 @@ def post_accounts(payload: AccountsPayload):
         "success": True,
         "accounts_processed": len(payload.accounts),
         "logins": [a.login for a in payload.accounts],
+        "stale_removed": len(stale),
     }
 
 
