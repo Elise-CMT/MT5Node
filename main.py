@@ -179,6 +179,24 @@ def health():
     return {"api": "ok", "redis": redis_status}
 
 
+@app.get("/stats", dependencies=[Security(verify_token)])
+def stats():
+    r = get_redis()
+    pipe = r.pipeline()
+    pipe.scard("positions:tickets")
+    pipe.scard("accounts:logins")
+    pipe.scard("deals:tickets")
+    pipe.get("positions:last_update")
+    pipe.get("accounts:last_update")
+    pipe.get("deals:last_update")
+    pos_count, acct_count, deal_count, pos_ts, acct_ts, deal_ts = pipe.execute()
+    return {
+        "positions": {"count": pos_count, "last_update": pos_ts},
+        "accounts":  {"count": acct_count, "last_update": acct_ts},
+        "deals":     {"count": deal_count, "last_update": deal_ts},
+    }
+
+
 # =============================================================================
 # Positions endpoints
 # =============================================================================
