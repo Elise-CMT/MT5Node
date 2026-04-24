@@ -1,11 +1,15 @@
+import gzip
 import json
 import os
 from datetime import datetime, timezone
 
 import redis
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
@@ -13,6 +17,26 @@ API_PORT   = int(os.environ.get("API_PORT", 8080))
 API_TOKEN  = os.environ.get("API_TOKEN", "f118da769ab686ae753192d548f67a3a371904b9d805f4c8fef293cda884fc7f")
 
 app  = FastAPI(title="MT5 Poller API")
+
+# Compress all responses automatically
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Decompress gzip-encoded request bodies transparently
+class GzipRequestMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.headers.get("Content-Encoding", "").lower() == "gzip":
+            try:
+                body = await request.body()
+                decompressed = gzip.decompress(body)
+                async def receive():
+                    return {"type": "http.request", "body": decompressed, "more_body": False}
+                request._receive = receive
+            except Exception as exc:
+                return JSONResponse({"error": f"gzip decompress failed: {exc}"}, status_code=400)
+        return await call_next(request)
+
+app.add_middleware(GzipRequestMiddleware)
+
 pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 bearer = HTTPBearer()
 
@@ -278,21 +302,13 @@ def get_all_positions():
 @app.post("/accounts", dependencies=[Security(verify_token)])
 def post_accounts(payload: AccountsPayload):
     """
-    Atomic snapshot replace: accounts no longer present in the group
-    (e.g. moved to a different group) are removed from Redis.
+    Upsert — safe for chunked ingestion (400k accounts are sent in batches).
+    Each account is stored by login; existing records are overwritten.
     """
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
-    new_logins = {str(a.login) for a in payload.accounts}
-
-    old_logins = r.smembers("accounts:logins") or set()
-    stale = old_logins - new_logins
 
     pipe = r.pipeline()
-    for lg in stale:
-        pipe.delete(f"account:{lg}")
-    pipe.delete("accounts:logins")
-    pipe.set("accounts:latest:raw", payload.model_dump_json())
     pipe.set("accounts:last_update", now)
     for acct in payload.accounts:
         pipe.set(f"account:{acct.login}", json.dumps(acct.model_dump()))
@@ -303,7 +319,6 @@ def post_accounts(payload: AccountsPayload):
         "success": True,
         "accounts_processed": len(payload.accounts),
         "logins": [a.login for a in payload.accounts],
-        "stale_removed": len(stale),
     }
 
 
