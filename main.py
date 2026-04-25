@@ -67,6 +67,7 @@ class Position(BaseModel):
     open_price: float
     price_current: float
     open_time: int
+    time_update: int = 0   # last modification time (SL/TP change, etc.)
     pnl: float
     swap: float
     notional_value: float
@@ -289,11 +290,17 @@ def post_positions(payload: PositionsPayload):
     for t in stale:
         pipe.delete(f"position:{t}")
     pipe.delete("positions:tickets")
+    pipe.delete("positions:watermark")
     pipe.set("positions:latest:raw", payload.model_dump_json())
     pipe.set("positions:last_update", now)
+    max_ts = 0
     for pos in payload.positions:
         pipe.set(f"position:{pos.ticket}", json.dumps(pos.model_dump()))
         pipe.sadd("positions:tickets", str(pos.ticket))
+        if pos.time_update > max_ts:
+            max_ts = pos.time_update
+    if max_ts:
+        pipe.set("positions:watermark", str(max_ts))
     pipe.execute()
 
     return {"success": True, "positions_processed": len(payload.positions),
@@ -328,8 +335,40 @@ def get_all_positions():
     return {"count": len(positions), "positions": positions}
 
 
+@app.get("/positions/watermark", dependencies=[Security(verify_token)])
+def positions_watermark():
+    r = get_redis()
+    wm = r.get("positions:watermark")
+    count = r.scard("positions:tickets")
+    return {"max_time_update": int(wm) if wm else 0, "count": count or 0}
+
+
+@app.post("/positions/upsert", dependencies=[Security(verify_token)])
+def upsert_positions(payload: PositionsPayload):
+    """Upsert positions without deleting stale records. Updates watermark."""
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    wm_raw = r.get("positions:watermark")
+    current_wm = int(wm_raw) if wm_raw else 0
+    max_ts = current_wm
+
+    pipe = r.pipeline()
+    pipe.set("positions:last_update", now)
+    for pos in payload.positions:
+        pipe.set(f"position:{pos.ticket}", json.dumps(pos.model_dump()))
+        pipe.sadd("positions:tickets", str(pos.ticket))
+        if pos.time_update > max_ts:
+            max_ts = pos.time_update
+    if max_ts > current_wm:
+        pipe.set("positions:watermark", str(max_ts))
+    pipe.execute()
+
+    return {"success": True, "positions_processed": len(payload.positions),
+            "tickets": [p.ticket for p in payload.positions]}
+
+
 # =============================================================================
-# Closed Positions (monthly closing deals)
+# Closed Positions (YTD closing deals)
 # =============================================================================
 
 @app.post("/closed_positions/reset", dependencies=[Security(verify_token)])
@@ -342,6 +381,7 @@ def reset_closed_positions():
         pipe.delete(f"closed_position:{t}")
     pipe.delete("closed_positions:tickets")
     pipe.delete("closed_positions:last_update")
+    pipe.delete("closed_positions:watermark")
     pipe.execute()
     return {"success": True, "cleared": len(tickets)}
 
@@ -382,6 +422,38 @@ def get_closed_position(ticket: int):
     if data is None:
         raise HTTPException(status_code=404, detail=f"Closed position {ticket} not found")
     return json.loads(data)
+
+
+@app.get("/closed_positions/watermark", dependencies=[Security(verify_token)])
+def closed_positions_watermark():
+    r = get_redis()
+    wm = r.get("closed_positions:watermark")
+    count = r.scard("closed_positions:tickets")
+    return {"max_close_time": int(wm) if wm else 0, "count": count or 0}
+
+
+@app.post("/closed_positions/upsert", dependencies=[Security(verify_token)])
+def upsert_closed_positions(payload: ClosedPositionsPayload):
+    """Upsert closed positions without resetting. Updates close_time watermark."""
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    wm_raw = r.get("closed_positions:watermark")
+    current_wm = int(wm_raw) if wm_raw else 0
+    max_ts = current_wm
+
+    pipe = r.pipeline()
+    pipe.set("closed_positions:last_update", now)
+    for cp in payload.closed_positions:
+        pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
+        pipe.sadd("closed_positions:tickets", str(cp.ticket))
+        if cp.close_time > max_ts:
+            max_ts = cp.close_time
+    if max_ts > current_wm:
+        pipe.set("closed_positions:watermark", str(max_ts))
+    pipe.execute()
+
+    return {"success": True, "closed_positions_processed": len(payload.closed_positions),
+            "tickets": [cp.ticket for cp in payload.closed_positions]}
 
 
 # =============================================================================
