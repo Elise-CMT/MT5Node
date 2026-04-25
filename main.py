@@ -331,6 +331,20 @@ def get_all_positions():
 # Closed Positions (monthly closing deals)
 # =============================================================================
 
+@app.post("/closed_positions/reset", dependencies=[Security(verify_token)])
+def reset_closed_positions():
+    """Clear all closed position data — call before the first chunk of a new push cycle."""
+    r = get_redis()
+    tickets = r.smembers("closed_positions:tickets") or set()
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.delete(f"closed_position:{t}")
+    pipe.delete("closed_positions:tickets")
+    pipe.delete("closed_positions:last_update")
+    pipe.execute()
+    return {"success": True, "cleared": len(tickets)}
+
+
 @app.post("/closed_positions", dependencies=[Security(verify_token)])
 def post_closed_positions(payload: ClosedPositionsPayload):
     r = get_redis()
@@ -372,6 +386,20 @@ def get_closed_position(ticket: int):
 # =============================================================================
 # Accounts
 # =============================================================================
+
+@app.post("/accounts/reset", dependencies=[Security(verify_token)])
+def reset_accounts():
+    """Clear all account data — call before the first chunk of a new push cycle."""
+    r = get_redis()
+    logins = r.smembers("accounts:logins") or set()
+    pipe = r.pipeline()
+    for lg in logins:
+        pipe.delete(f"account:{lg}")
+    pipe.delete("accounts:logins")
+    pipe.delete("accounts:last_update")
+    pipe.execute()
+    return {"success": True, "cleared": len(logins)}
+
 
 @app.post("/accounts", dependencies=[Security(verify_token)])
 def post_accounts(payload: AccountsPayload):
@@ -481,6 +509,21 @@ def get_deal(ticket: int):
 # =============================================================================
 # Conversion Rates (with history)
 # =============================================================================
+
+@app.post("/rates/reset", dependencies=[Security(verify_token)])
+def reset_rates():
+    """Clear all rate data and history — call before posting a new rates snapshot."""
+    r = get_redis()
+    symbols = r.smembers("rates:symbols") or set()
+    pipe = r.pipeline()
+    for s in symbols:
+        pipe.delete(f"rate:{s}")
+        pipe.delete(f"rate:{s}:history")
+    pipe.delete("rates:symbols")
+    pipe.delete("rates:last_update")
+    pipe.execute()
+    return {"success": True, "cleared": len(symbols)}
+
 
 @app.post("/rates", dependencies=[Security(verify_token)])
 def post_rates(payload: RatesPayload):
