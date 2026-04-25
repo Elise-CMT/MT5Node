@@ -98,7 +98,8 @@ class ClosedPosition(BaseModel):
     commission: float
     swap: float
     fee: float
-    time: int             # close time (unix)
+    open_time: int = 0    # when position was originally opened (0 if unknown)
+    close_time: int       # when position was closed
     comment: str = ""
 
 
