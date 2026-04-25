@@ -373,12 +373,20 @@ def upsert_positions(payload: PositionsPayload):
 
 @app.post("/closed_positions/reset", dependencies=[Security(verify_token)])
 def reset_closed_positions():
-    """Clear all closed position data — call before the first chunk of a new push cycle."""
     r = get_redis()
     tickets = r.smembers("closed_positions:tickets") or set()
+    # Also collect all month-keyed sets
+    cursor, month_keys = 0, []
+    while True:
+        cursor, keys = r.scan(cursor, match="closed_positions:month:*", count=200)
+        month_keys.extend(keys)
+        if cursor == 0:
+            break
     pipe = r.pipeline()
     for t in tickets:
         pipe.delete(f"closed_position:{t}")
+    for k in month_keys:
+        pipe.delete(k)
     pipe.delete("closed_positions:tickets")
     pipe.delete("closed_positions:last_update")
     pipe.delete("closed_positions:watermark")
@@ -386,20 +394,71 @@ def reset_closed_positions():
     return {"success": True, "cleared": len(tickets)}
 
 
+def _month_key(ts: int) -> str:
+    from datetime import datetime, timezone as _tz
+    d = datetime.fromtimestamp(ts, tz=_tz.utc)
+    return f"{d.year}-{d.month:02d}"
+
+
 @app.post("/closed_positions", dependencies=[Security(verify_token)])
 def post_closed_positions(payload: ClosedPositionsPayload):
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
-
     pipe = r.pipeline()
     pipe.set("closed_positions:last_update", now)
     for cp in payload.closed_positions:
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
+        pipe.sadd(f"closed_positions:month:{_month_key(cp.close_time)}", str(cp.ticket))
     pipe.execute()
-
     return {"success": True, "closed_positions_processed": len(payload.closed_positions),
             "tickets": [cp.ticket for cp in payload.closed_positions]}
+
+
+@app.get("/closed_positions/months", dependencies=[Security(verify_token)])
+def closed_positions_months():
+    """Return {month: count} for all months present in Redis."""
+    r = get_redis()
+    months = {}
+    cursor = 0
+    while True:
+        cursor, keys = r.scan(cursor, match="closed_positions:month:*", count=200)
+        for key in keys:
+            month = key.replace("closed_positions:month:", "")
+            months[month] = r.scard(key)
+        if cursor == 0:
+            break
+    return {"months": months}
+
+
+@app.post("/closed_positions/month/{year}/{month}", dependencies=[Security(verify_token)])
+def post_closed_positions_month(year: int, month: int, payload: ClosedPositionsPayload):
+    """Snapshot-replace closed positions for a single calendar month."""
+    mk = f"{year}-{month:02d}"
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Remove old records for this month
+    old_tickets = r.smembers(f"closed_positions:month:{mk}") or set()
+    pipe = r.pipeline()
+    for t in old_tickets:
+        pipe.delete(f"closed_position:{t}")
+        pipe.srem("closed_positions:tickets", t)
+    pipe.delete(f"closed_positions:month:{mk}")
+    pipe.execute()
+
+    # Insert new batch
+    pipe = r.pipeline()
+    pipe.set("closed_positions:last_update", now)
+    for cp in payload.closed_positions:
+        pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
+        pipe.sadd("closed_positions:tickets", str(cp.ticket))
+        pipe.sadd(f"closed_positions:month:{mk}", str(cp.ticket))
+    pipe.execute()
+
+    return {"success": True, "month": mk,
+            "closed_positions_processed": len(payload.closed_positions),
+            "replaced": len(old_tickets)}
 
 
 @app.get("/closed_positions", dependencies=[Security(verify_token)])
@@ -446,6 +505,7 @@ def upsert_closed_positions(payload: ClosedPositionsPayload):
     for cp in payload.closed_positions:
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
+        pipe.sadd(f"closed_positions:month:{_month_key(cp.close_time)}", str(cp.ticket))
         if cp.close_time > max_ts:
             max_ts = cp.close_time
     if max_ts > current_wm:
