@@ -113,7 +113,8 @@ def _month_range(from_month: str, to_month: str) -> list[str]:
 # =============================================================================
 
 class Position(BaseModel):
-    ticket: int
+    ticket: int        # position ticket (= position_id)
+    position_id: int   # same as ticket — explicit alias for joining with closed_positions
     login: int
     symbol: str
     cmd: int
