@@ -76,6 +76,10 @@ def _month_meta_key(month_key: str) -> str:
     return f"closed_positions:month_meta:{month_key}"
 
 
+def _deal_month_meta_key(month_key: str) -> str:
+    return f"deals:month_meta:{month_key}"
+
+
 def _parse_date_param(value: str, name: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -180,8 +184,10 @@ class ClosedPosition(BaseModel):
     commission: float
     swap: float
     fee: float
-    open_time: int = 0    # when position was originally opened (0 if unknown)
-    close_time: int       # when position was closed
+    open_time: int = 0       # when position was originally opened (0 if unknown)
+    close_time: int          # when position was closed
+    contract_size: float = 0.0
+    notional_value: float = 0.0  # volume_lots * contract_size * close_price
     comment: str = ""
 
 
@@ -271,22 +277,43 @@ class AccountsPayload(BaseModel):
 
 class Deal(BaseModel):
     ticket: int
+    external_id: str = ""
     order: int
     position_id: int
     login: int
+    dealer: int = 0
     symbol: str
     action: int
     entry: int
+    digits: int = 0
+    digits_currency: int = 0
+    contract_size: float = 0.0
     price: float
     price_sl: float
     price_tp: float
+    price_position: float = 0.0
+    price_gateway: float = 0.0
+    market_bid: float = 0.0
+    market_ask: float = 0.0
+    market_last: float = 0.0
     volume_lots: float
     volume_closed_lots: float
+    volume_ext: int = 0
+    volume_closed_ext: int = 0
     profit: float
+    profit_raw: float = 0.0
     commission: float
     swap: float
     fee: float
+    rate_profit: float = 0.0
+    rate_margin: float = 0.0
+    tick_value: float = 0.0
+    tick_size: float = 0.0
     reason: int
+    flags: int = 0
+    modification_flags: int = 0
+    expert_id: int = 0
+    gateway: str = ""
     time: int
     time_msc: int
     comment: str = ""
@@ -298,6 +325,37 @@ class DealsPayload(BaseModel):
     @field_validator("deals")
     @classmethod
     def must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError("deals array must not be empty")
+        return v
+
+
+class DealMonthSnapshotBeginPayload(BaseModel):
+    expected_chunks: int = 0
+    expected_deals: int = 0
+
+    @field_validator("expected_chunks", "expected_deals")
+    @classmethod
+    def must_not_be_negative(cls, v):
+        if v < 0:
+            raise ValueError("value must not be negative")
+        return v
+
+
+class DealMonthSnapshotChunkPayload(BaseModel):
+    chunk_index: int
+    deals: list[Deal]
+
+    @field_validator("chunk_index")
+    @classmethod
+    def chunk_index_must_not_be_negative(cls, v):
+        if v < 0:
+            raise ValueError("chunk_index must not be negative")
+        return v
+
+    @field_validator("deals")
+    @classmethod
+    def deals_must_not_be_empty(cls, v):
         if not v:
             raise ValueError("deals array must not be empty")
         return v
@@ -805,8 +863,7 @@ def post_accounts(payload: AccountsPayload):
         pipe.set(f"account:{acct.login}", json.dumps(acct.model_dump()))
         pipe.sadd("accounts:logins", str(acct.login))
     pipe.execute()
-    return {"success": True, "accounts_processed": len(payload.accounts),
-            "logins": [a.login for a in payload.accounts]}
+    return {"success": True, "accounts_processed": len(payload.accounts)}
 
 
 @app.get("/accounts/latest", dependencies=[Security(verify_token)])
@@ -850,6 +907,16 @@ def get_account(login: int):
 # Deals
 # =============================================================================
 
+def _validate_month(year: int, month: int) -> str:
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    return f"{year}-{month:02d}"
+
+
+def _deal_snapshot_prefix(month_key: str, snapshot_id: str) -> str:
+    return f"deals:month_snapshot:{month_key}:{snapshot_id}"
+
+
 @app.post("/deals", dependencies=[Security(verify_token)])
 def post_deals(payload: DealsPayload):
     r = get_redis()
@@ -859,9 +926,167 @@ def post_deals(payload: DealsPayload):
     for deal in payload.deals:
         pipe.set(f"deal:{deal.ticket}", json.dumps(deal.model_dump()))
         pipe.sadd("deals:tickets", str(deal.ticket))
+        pipe.sadd(f"deals:month:{_month_key(deal.time)}", str(deal.ticket))
     pipe.execute()
-    return {"success": True, "deals_processed": len(payload.deals),
-            "tickets": [d.ticket for d in payload.deals]}
+    return {"success": True, "deals_processed": len(payload.deals)}
+
+
+@app.get("/deals/months", dependencies=[Security(verify_token)])
+def deal_months():
+    r = get_redis()
+    months: dict[str, int] = {}
+    metadata: dict[str, dict] = {}
+
+    for key in _scan_keys(r, "deals:month:*"):
+        month = key.replace("deals:month:", "")
+        months[month] = r.scard(key)
+
+    synced_months = set(r.smembers("deals:months:synced") or set())
+    for month in sorted(synced_months | set(months.keys())):
+        meta = r.hgetall(_deal_month_meta_key(month))
+        if meta:
+            count = int(meta.get("count") or 0)
+            months[month] = count
+            metadata[month] = {
+                "month": month,
+                "count": count,
+                "last_update": meta.get("last_update"),
+                "synced": str(meta.get("synced", "0")) == "1",
+            }
+        else:
+            metadata[month] = {
+                "month": month,
+                "count": months.get(month, 0),
+                "last_update": None,
+                "synced": True,
+            }
+
+    return {"months": months, "metadata": metadata}
+
+
+@app.get("/deals/months/check", dependencies=[Security(verify_token)])
+def check_deal_months(from_date: str, to_date: str):
+    r = get_redis()
+    from_month = _month_key_from_date(_parse_date_param(from_date, "from_date"))
+    to_month = _month_key_from_date(_parse_date_param(to_date, "to_date"))
+    required_months = _month_range(from_month, to_month)
+
+    present = set(r.smembers("deals:months:synced") or set())
+    for key in _scan_keys(r, "deals:month:*"):
+        present.add(key.replace("deals:month:", ""))
+
+    present_months = [m for m in required_months if m in present]
+    missing_months = [m for m in required_months if m not in present]
+    current_month = _month_key_from_date(datetime.now(timezone.utc).date())
+    return {
+        "ok": not missing_months,
+        "from_month": from_month,
+        "to_month": to_month,
+        "missing_months": missing_months,
+        "present_months": present_months,
+        "current_month": current_month,
+    }
+
+
+@app.post("/deals/month/{year}/{month}/snapshot/begin", dependencies=[Security(verify_token)])
+def begin_deal_month_snapshot(year: int, month: int, payload: DealMonthSnapshotBeginPayload):
+    mk = _validate_month(year, month)
+    r = get_redis()
+    snapshot_id = uuid.uuid4().hex
+    prefix = _deal_snapshot_prefix(mk, snapshot_id)
+    r.hset(f"{prefix}:meta", mapping={
+        "month": mk,
+        "expected_chunks": payload.expected_chunks,
+        "expected_deals": payload.expected_deals,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    r.expire(f"{prefix}:meta", 86400)
+    r.expire(f"{prefix}:chunks", 86400)
+    return {"success": True, "snapshot_id": snapshot_id, "month": mk}
+
+
+@app.post("/deals/month/{year}/{month}/snapshot/{snapshot_id}/chunk", dependencies=[Security(verify_token)])
+def post_deal_month_snapshot_chunk(
+    year: int,
+    month: int,
+    snapshot_id: str,
+    payload: DealMonthSnapshotChunkPayload,
+):
+    mk = _validate_month(year, month)
+    r = get_redis()
+    prefix = _deal_snapshot_prefix(mk, snapshot_id)
+    if not r.exists(f"{prefix}:meta"):
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    chunk_key = f"{prefix}:chunk:{payload.chunk_index}"
+    r.set(chunk_key, json.dumps([d.model_dump() for d in payload.deals]), ex=86400)
+    r.sadd(f"{prefix}:chunks", str(payload.chunk_index))
+    r.expire(f"{prefix}:chunks", 86400)
+    return {"success": True, "month": mk, "chunk_index": payload.chunk_index,
+            "deals_processed": len(payload.deals)}
+
+
+@app.post("/deals/month/{year}/{month}/snapshot/{snapshot_id}/commit", dependencies=[Security(verify_token)])
+def commit_deal_month_snapshot(year: int, month: int, snapshot_id: str):
+    mk = _validate_month(year, month)
+    r = get_redis()
+    prefix = _deal_snapshot_prefix(mk, snapshot_id)
+    meta_key = f"{prefix}:meta"
+    meta = r.hgetall(meta_key)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    expected_chunks = int(meta.get("expected_chunks") or 0)
+    expected_deals = int(meta.get("expected_deals") or 0)
+    received = {int(x) for x in (r.smembers(f"{prefix}:chunks") or set())}
+    missing = [i for i in range(expected_chunks) if i not in received]
+    if missing:
+        raise HTTPException(status_code=409, detail={"missing_chunks": missing})
+
+    deals: list[dict] = []
+    chunk_keys = [f"{prefix}:chunk:{i}" for i in range(expected_chunks)]
+    if chunk_keys:
+        raw_chunks = r.mget(chunk_keys)
+        for i, raw in enumerate(raw_chunks):
+            if raw is None:
+                raise HTTPException(status_code=409, detail={"missing_chunks": [i]})
+            deals.extend(json.loads(raw))
+
+    if len(deals) != expected_deals:
+        raise HTTPException(
+            status_code=409,
+            detail={"expected_deals": expected_deals, "received_deals": len(deals)},
+        )
+
+    old_tickets = r.smembers(f"deals:month:{mk}") or set()
+    now = datetime.now(timezone.utc).isoformat()
+    pipe = r.pipeline()
+    for ticket in old_tickets:
+        pipe.delete(f"deal:{ticket}")
+        pipe.srem("deals:tickets", ticket)
+    pipe.delete(f"deals:month:{mk}")
+    pipe.execute()
+
+    pipe = r.pipeline()
+    pipe.set("deals:last_update", now)
+    pipe.hset(_deal_month_meta_key(mk), mapping={
+        "month": mk,
+        "count": len(deals),
+        "last_update": now,
+        "synced": 1,
+    })
+    pipe.sadd("deals:months:synced", mk)
+    for deal in deals:
+        ticket = str(deal["ticket"])
+        pipe.set(f"deal:{ticket}", json.dumps(deal))
+        pipe.sadd("deals:tickets", ticket)
+        pipe.sadd(f"deals:month:{mk}", ticket)
+    pipe.execute()
+
+    cleanup = chunk_keys + [meta_key, f"{prefix}:chunks"]
+    _delete_keys(r, cleanup)
+    return {"success": True, "month": mk, "deals_processed": len(deals),
+            "replaced": len(old_tickets)}
 
 
 @app.get("/deals", dependencies=[Security(verify_token)])
