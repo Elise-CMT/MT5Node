@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timezone
 
 import msgpack
 import redis
@@ -54,6 +55,55 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(bearer)):
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
+def _delete_keys(r: redis.Redis, keys: list[str]):
+    if not keys:
+        return
+    for i in range(0, len(keys), 1000):
+        r.delete(*keys[i : i + 1000])
+
+
+def _scan_keys(r: redis.Redis, match: str) -> list[str]:
+    cursor = 0
+    keys: list[str] = []
+    while True:
+        cursor, batch = r.scan(cursor, match=match, count=500)
+        keys.extend(batch)
+        if cursor == 0:
+            return keys
+
+
+def _month_meta_key(month_key: str) -> str:
+    return f"closed_positions:month_meta:{month_key}"
+
+
+def _parse_date_param(value: str, name: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{name} must be YYYY-MM-DD")
+
+
+def _month_key_from_date(value: date) -> str:
+    return f"{value.year}-{value.month:02d}"
+
+
+def _month_range(from_month: str, to_month: str) -> list[str]:
+    start_year, start_month = [int(x) for x in from_month.split("-")]
+    end_year, end_month = [int(x) for x in to_month.split("-")]
+    if (start_year, start_month) > (end_year, end_month):
+        raise HTTPException(status_code=400, detail="from_date must be before or equal to to_date")
+    months = []
+    year, month = start_year, start_month
+    while (year, month) <= (end_year, end_month):
+        months.append(f"{year}-{month:02d}")
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return months
+
+
 # =============================================================================
 # Pydantic models
 # =============================================================================
@@ -86,6 +136,37 @@ class PositionsPayload(BaseModel):
         return v
 
 
+class PositionsSnapshotBeginPayload(BaseModel):
+    expected_chunks: int = 0
+    expected_positions: int = 0
+
+    @field_validator("expected_chunks", "expected_positions")
+    @classmethod
+    def must_not_be_negative(cls, v):
+        if v < 0:
+            raise ValueError("value must not be negative")
+        return v
+
+
+class PositionsSnapshotChunkPayload(BaseModel):
+    chunk_index: int
+    positions: list[Position]
+
+    @field_validator("chunk_index")
+    @classmethod
+    def chunk_index_must_not_be_negative(cls, v):
+        if v < 0:
+            raise ValueError("chunk_index must not be negative")
+        return v
+
+    @field_validator("positions")
+    @classmethod
+    def positions_must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError("positions array must not be empty")
+        return v
+
+
 class ClosedPosition(BaseModel):
     ticket: int           # closing deal ticket
     position_id: int
@@ -113,6 +194,10 @@ class ClosedPositionsPayload(BaseModel):
         if not v:
             raise ValueError("closed_positions array must not be empty")
         return v
+
+
+class MonthlyClosedPositionsPayload(BaseModel):
+    closed_positions: list[ClosedPosition] = []
 
 
 class Account(BaseModel):
@@ -307,6 +392,121 @@ def post_positions(payload: PositionsPayload):
             "tickets": [p.ticket for p in payload.positions], "stale_removed": len(stale)}
 
 
+SNAPSHOT_TTL_SECONDS = 24 * 60 * 60
+
+
+def _snapshot_prefix(snapshot_id: str) -> str:
+    return f"positions:snapshot:{snapshot_id}"
+
+
+@app.post("/positions/snapshot/begin", dependencies=[Security(verify_token)])
+def begin_positions_snapshot(payload: PositionsSnapshotBeginPayload):
+    r = get_redis()
+    snapshot_id = uuid.uuid4().hex
+    prefix = _snapshot_prefix(snapshot_id)
+    now = datetime.now(timezone.utc).isoformat()
+    r.hset(f"{prefix}:meta", mapping={
+        "created_at": now,
+        "expected_chunks": payload.expected_chunks,
+        "expected_positions": payload.expected_positions,
+        "max_time_update": 0,
+    })
+    r.expire(f"{prefix}:meta", SNAPSHOT_TTL_SECONDS)
+    return {"success": True, "snapshot_id": snapshot_id}
+
+
+@app.post("/positions/snapshot/{snapshot_id}/chunk", dependencies=[Security(verify_token)])
+def post_positions_snapshot_chunk(snapshot_id: str, payload: PositionsSnapshotChunkPayload):
+    r = get_redis()
+    prefix = _snapshot_prefix(snapshot_id)
+    meta_key = f"{prefix}:meta"
+    meta = r.hgetall(meta_key)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
+
+    expected_chunks = int(meta.get("expected_chunks") or 0)
+    if expected_chunks and payload.chunk_index >= expected_chunks:
+        raise HTTPException(status_code=400, detail="chunk_index exceeds expected_chunks")
+
+    max_ts = int(meta.get("max_time_update") or 0)
+    tickets_key = f"{prefix}:tickets"
+    chunks_key = f"{prefix}:chunks"
+    pipe = r.pipeline()
+    for pos in payload.positions:
+        pipe.set(f"{prefix}:position:{pos.ticket}", json.dumps(pos.model_dump()))
+        pipe.expire(f"{prefix}:position:{pos.ticket}", SNAPSHOT_TTL_SECONDS)
+        pipe.sadd(tickets_key, str(pos.ticket))
+        if pos.time_update > max_ts:
+            max_ts = pos.time_update
+    pipe.sadd(chunks_key, str(payload.chunk_index))
+    pipe.hset(meta_key, "max_time_update", max_ts)
+    pipe.expire(tickets_key, SNAPSHOT_TTL_SECONDS)
+    pipe.expire(chunks_key, SNAPSHOT_TTL_SECONDS)
+    pipe.expire(meta_key, SNAPSHOT_TTL_SECONDS)
+    pipe.execute()
+
+    return {"success": True, "snapshot_id": snapshot_id,
+            "chunk_index": payload.chunk_index, "positions_processed": len(payload.positions)}
+
+
+@app.post("/positions/snapshot/{snapshot_id}/commit", dependencies=[Security(verify_token)])
+def commit_positions_snapshot(snapshot_id: str):
+    r = get_redis()
+    prefix = _snapshot_prefix(snapshot_id)
+    meta_key = f"{prefix}:meta"
+    meta = r.hgetall(meta_key)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
+
+    expected_chunks = int(meta.get("expected_chunks") or 0)
+    expected_positions = int(meta.get("expected_positions") or 0)
+    chunks_seen = r.scard(f"{prefix}:chunks")
+    if expected_chunks and chunks_seen != expected_chunks:
+        raise HTTPException(status_code=409,
+                            detail=f"Snapshot has {chunks_seen}/{expected_chunks} chunks")
+
+    new_tickets = r.smembers(f"{prefix}:tickets") or set()
+    if expected_positions and len(new_tickets) != expected_positions:
+        raise HTTPException(status_code=409,
+                            detail=f"Snapshot has {len(new_tickets)}/{expected_positions} positions")
+
+    pipe = r.pipeline()
+    for t in new_tickets:
+        pipe.get(f"{prefix}:position:{t}")
+    raw_records = pipe.execute()
+    records = [(t, d) for t, d in zip(new_tickets, raw_records) if d]
+    if len(records) != len(new_tickets):
+        raise HTTPException(status_code=409, detail="Snapshot is missing one or more position records")
+
+    old_tickets = r.smembers("positions:tickets") or set()
+    stale = old_tickets - new_tickets
+    now = datetime.now(timezone.utc).isoformat()
+    max_ts = int(meta.get("max_time_update") or 0)
+
+    pipe = r.pipeline()
+    for t in stale:
+        pipe.delete(f"position:{t}")
+    pipe.delete("positions:tickets")
+    pipe.delete("positions:watermark")
+    pipe.set("positions:last_update", now)
+    pipe.set("positions:latest:raw", json.dumps({
+        "snapshot_id": snapshot_id,
+        "positions_count": len(records),
+        "committed_at": now,
+    }))
+    for t, data in records:
+        pipe.set(f"position:{t}", data)
+        pipe.sadd("positions:tickets", t)
+    if max_ts:
+        pipe.set("positions:watermark", str(max_ts))
+    pipe.execute()
+
+    _delete_keys(r, _scan_keys(r, f"{prefix}:*"))
+
+    return {"success": True, "snapshot_id": snapshot_id,
+            "positions_processed": len(records), "stale_removed": len(stale)}
+
+
 @app.get("/positions/latest", dependencies=[Security(verify_token)])
 def get_positions_latest():
     r = get_redis()
@@ -375,18 +575,16 @@ def upsert_positions(payload: PositionsPayload):
 def reset_closed_positions():
     r = get_redis()
     tickets = r.smembers("closed_positions:tickets") or set()
-    # Also collect all month-keyed sets
-    cursor, month_keys = 0, []
-    while True:
-        cursor, keys = r.scan(cursor, match="closed_positions:month:*", count=200)
-        month_keys.extend(keys)
-        if cursor == 0:
-            break
+    month_keys = _scan_keys(r, "closed_positions:month:*")
+    month_meta_keys = _scan_keys(r, "closed_positions:month_meta:*")
     pipe = r.pipeline()
     for t in tickets:
         pipe.delete(f"closed_position:{t}")
     for k in month_keys:
         pipe.delete(k)
+    for k in month_meta_keys:
+        pipe.delete(k)
+    pipe.delete("closed_positions:months:synced")
     pipe.delete("closed_positions:tickets")
     pipe.delete("closed_positions:last_update")
     pipe.delete("closed_positions:watermark")
@@ -398,6 +596,16 @@ def _month_key(ts: int) -> str:
     from datetime import datetime, timezone as _tz
     d = datetime.fromtimestamp(ts, tz=_tz.utc)
     return f"{d.year}-{d.month:02d}"
+
+
+def _mark_closed_positions_month(r: redis.Redis, month_key: str, count: int, now: str):
+    r.hset(_month_meta_key(month_key), mapping={
+        "month": month_key,
+        "count": count,
+        "last_update": now,
+        "synced": 1,
+    })
+    r.sadd("closed_positions:months:synced", month_key)
 
 
 @app.post("/closed_positions", dependencies=[Security(verify_token)])
@@ -417,23 +625,68 @@ def post_closed_positions(payload: ClosedPositionsPayload):
 
 @app.get("/closed_positions/months", dependencies=[Security(verify_token)])
 def closed_positions_months():
-    """Return {month: count} for all months present in Redis."""
+    """Return month counts plus explicit sync metadata."""
     r = get_redis()
-    months = {}
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="closed_positions:month:*", count=200)
-        for key in keys:
-            month = key.replace("closed_positions:month:", "")
-            months[month] = r.scard(key)
-        if cursor == 0:
-            break
-    return {"months": months}
+    months: dict[str, int] = {}
+    metadata: dict[str, dict] = {}
+
+    for key in _scan_keys(r, "closed_positions:month:*"):
+        month = key.replace("closed_positions:month:", "")
+        months[month] = r.scard(key)
+
+    synced_months = set(r.smembers("closed_positions:months:synced") or set())
+    for month in sorted(synced_months | set(months.keys())):
+        meta = r.hgetall(_month_meta_key(month))
+        if meta:
+            count = int(meta.get("count") or 0)
+            months[month] = count
+            metadata[month] = {
+                "month": month,
+                "count": count,
+                "last_update": meta.get("last_update"),
+                "synced": str(meta.get("synced", "0")) == "1",
+            }
+        else:
+            count = months.get(month, 0)
+            metadata[month] = {
+                "month": month,
+                "count": count,
+                "last_update": None,
+                "synced": True,
+            }
+
+    return {"months": months, "metadata": metadata}
+
+
+@app.get("/closed_positions/months/check", dependencies=[Security(verify_token)])
+def check_closed_positions_months(from_date: str, to_date: str):
+    r = get_redis()
+    from_month = _month_key_from_date(_parse_date_param(from_date, "from_date"))
+    to_month = _month_key_from_date(_parse_date_param(to_date, "to_date"))
+    required_months = _month_range(from_month, to_month)
+
+    present = set(r.smembers("closed_positions:months:synced") or set())
+    for key in _scan_keys(r, "closed_positions:month:*"):
+        present.add(key.replace("closed_positions:month:", ""))
+
+    present_months = [m for m in required_months if m in present]
+    missing_months = [m for m in required_months if m not in present]
+    current_month = _month_key_from_date(datetime.now(timezone.utc).date())
+    return {
+        "ok": not missing_months,
+        "from_month": from_month,
+        "to_month": to_month,
+        "missing_months": missing_months,
+        "present_months": present_months,
+        "current_month": current_month,
+    }
 
 
 @app.post("/closed_positions/month/{year}/{month}", dependencies=[Security(verify_token)])
-def post_closed_positions_month(year: int, month: int, payload: ClosedPositionsPayload):
+def post_closed_positions_month(year: int, month: int, payload: MonthlyClosedPositionsPayload):
     """Snapshot-replace closed positions for a single calendar month."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
     mk = f"{year}-{month:02d}"
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
@@ -450,6 +703,13 @@ def post_closed_positions_month(year: int, month: int, payload: ClosedPositionsP
     # Insert new batch
     pipe = r.pipeline()
     pipe.set("closed_positions:last_update", now)
+    pipe.hset(_month_meta_key(mk), mapping={
+        "month": mk,
+        "count": len(payload.closed_positions),
+        "last_update": now,
+        "synced": 1,
+    })
+    pipe.sadd("closed_positions:months:synced", mk)
     for cp in payload.closed_positions:
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
@@ -470,7 +730,8 @@ def get_closed_positions():
     pipe = r.pipeline()
     for t in tickets:
         pipe.get(f"closed_position:{t}")
-    records = sorted([json.loads(d) for d in pipe.execute() if d], key=lambda x: x["time"], reverse=True)
+    records = sorted([json.loads(d) for d in pipe.execute() if d],
+                     key=lambda x: x.get("close_time", 0), reverse=True)
     return {"count": len(records), "closed_positions": records}
 
 

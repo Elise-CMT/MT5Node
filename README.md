@@ -7,8 +7,13 @@ FastAPI service that receives trading position data and stores it in Redis.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | /positions | Store position data |
+| POST | /positions/snapshot/begin | Start a staged open-position snapshot |
+| POST | /positions/snapshot/{snapshot_id}/chunk | Upload one staged position chunk |
+| POST | /positions/snapshot/{snapshot_id}/commit | Replace live open positions from staged chunks |
 | GET | /health | API + Redis health check |
+| GET | /stats | Redis table counts and last updates |
 | GET | /positions/latest | Retrieve latest stored data |
+| GET | /closed_positions/months/check | Check whether a date range has synced closed-position months |
 
 ## Redis Keys
 
@@ -18,6 +23,9 @@ FastAPI service that receives trading position data and stores it in Redis.
 | `positions:last_update` | string | ISO timestamp of last POST |
 | `position:{ticket}` | string | JSON for individual position |
 | `positions:tickets` | set | All known ticket IDs |
+| `positions:snapshot:{id}:*` | mixed | Temporary staged open-position snapshot keys |
+| `closed_positions:month_meta:{YYYY-MM}` | hash | Monthly closed-position sync metadata |
+| `closed_positions:months:synced` | set | Months that have been synced, including zero-row months |
 
 ## Setup
 
