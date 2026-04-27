@@ -179,7 +179,8 @@ class ClosedPosition(BaseModel):
     symbol: str
     action: int           # original direction (0=buy 1=sell)
     entry: int            # 1=OUT 2=INOUT 3=OUT_BY
-    price: float          # close price
+    open_price: float = 0.0   # position's weighted average open price (deal.PricePosition)
+    close_price: float        # this deal's execution price (deal.Price)
     volume_lots: float
     profit: float
     commission: float
