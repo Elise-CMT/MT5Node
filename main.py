@@ -72,6 +72,22 @@ def _scan_keys(r: redis.Redis, match: str) -> list[str]:
             return keys
 
 
+@app.on_event("startup")
+def cleanup_legacy_balance_ops_keys():
+    """One-shot purge of legacy `balance_op:*` / `balance_ops:*` Redis keys, replaced
+    by the `deposits_withdrawals` feature. Idempotent — does nothing once already clean,
+    so the hook is safe to leave indefinitely."""
+    try:
+        r = get_redis()
+        keys = _scan_keys(r, "balance_op:*") + _scan_keys(r, "balance_ops:*")
+        if not keys:
+            return
+        _delete_keys(r, keys)
+        print(f"[startup] Purged {len(keys)} legacy balance_op(s):* keys")
+    except Exception as exc:
+        print(f"[startup] Legacy balance_ops cleanup failed: {exc}")
+
+
 def _month_meta_key(month_key: str) -> str:
     return f"closed_positions:month_meta:{month_key}"
 
@@ -391,6 +407,22 @@ class RatesPayload(BaseModel):
         return v
 
 
+class DepositWithdrawal(BaseModel):
+    ticket:              int
+    login:               int
+    time:                int
+    time_msc:            int = 0
+    amount:              float           # deal.Profit() — positive=deposit, negative=withdrawal
+    comment:             str = ""        # "Deposit, Wire Transfer" / "Withdrawal,Wire Transfer" / ...
+    currency:            str = ""        # account deposit currency
+    computed_amount_usd: float = 0.0
+    direction:           str = ""        # "deposit" or "withdrawal"
+
+
+class DepositsWithdrawalsPayload(BaseModel):
+    deposits_withdrawals: list[DepositWithdrawal]
+
+
 # =============================================================================
 # Health & Stats
 # =============================================================================
@@ -414,18 +446,21 @@ def stats():
     pipe.scard("deals:tickets")
     pipe.scard("closed_positions:tickets")
     pipe.scard("rates:symbols")
+    pipe.scard("deposits_withdrawals:tickets")
     pipe.get("positions:last_update")
     pipe.get("accounts:last_update")
     pipe.get("deals:last_update")
     pipe.get("closed_positions:last_update")
     pipe.get("rates:last_update")
-    pos, acct, deal, cpx, rate, pts, ats, dts, cpts, rts = pipe.execute()
+    pipe.get("deposits_withdrawals:last_update")
+    pos, acct, deal, cpx, rate, dwc, pts, ats, dts, cpts, rts, dwts = pipe.execute()
     return {
-        "positions":         {"count": pos,  "last_update": pts},
-        "accounts":          {"count": acct, "last_update": ats},
-        "deals":             {"count": deal, "last_update": dts},
-        "closed_positions":  {"count": cpx,  "last_update": cpts},
-        "rates":             {"count": rate, "last_update": rts},
+        "positions":             {"count": pos,  "last_update": pts},
+        "accounts":              {"count": acct, "last_update": ats},
+        "deals":                 {"count": deal, "last_update": dts},
+        "closed_positions":      {"count": cpx,  "last_update": cpts},
+        "rates":                 {"count": rate, "last_update": rts},
+        "deposits_withdrawals":  {"count": dwc,  "last_update": dwts},
     }
 
 
@@ -1197,3 +1232,56 @@ def get_rate_history(symbol: str, limit: int = 60):
         raise HTTPException(status_code=404, detail=f"No history for {symbol}")
     history = [json.loads(e) for e in raw_list]
     return {"symbol": symbol, "count": len(history), "history": history}
+
+
+# =============================================================================
+# Deposits & Withdrawals (DEAL_BALANCE only — action=2)
+# =============================================================================
+
+@app.post("/deposits_withdrawals/reset", dependencies=[Security(verify_token)])
+def reset_deposits_withdrawals():
+    r = get_redis()
+    tickets = r.smembers("deposits_withdrawals:tickets") or set()
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.delete(f"deposit_withdrawal:{t}")
+    pipe.delete("deposits_withdrawals:tickets")
+    pipe.delete("deposits_withdrawals:last_update")
+    pipe.execute()
+    return {"success": True, "cleared": len(tickets)}
+
+
+@app.post("/deposits_withdrawals", dependencies=[Security(verify_token)])
+def post_deposits_withdrawals(payload: DepositsWithdrawalsPayload):
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    pipe = r.pipeline()
+    for d in payload.deposits_withdrawals:
+        pipe.set(f"deposit_withdrawal:{d.ticket}", d.model_dump_json())
+        pipe.sadd("deposits_withdrawals:tickets", str(d.ticket))
+    pipe.set("deposits_withdrawals:last_update", now)
+    pipe.execute()
+    return {"success": True, "deposits_withdrawals_processed": len(payload.deposits_withdrawals)}
+
+
+@app.get("/deposits_withdrawals", dependencies=[Security(verify_token)])
+def get_all_deposits_withdrawals():
+    r = get_redis()
+    tickets = list(r.smembers("deposits_withdrawals:tickets"))
+    if not tickets:
+        return {"count": 0, "deposits_withdrawals": []}
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deposit_withdrawal:{t}")
+    rows = sorted([json.loads(d) for d in pipe.execute() if d],
+                  key=lambda x: x["time"], reverse=True)
+    return {"count": len(rows), "deposits_withdrawals": rows}
+
+
+@app.get("/deposits_withdrawals/{ticket}", dependencies=[Security(verify_token)])
+def get_deposit_withdrawal(ticket: int):
+    r = get_redis()
+    data = r.get(f"deposit_withdrawal:{ticket}")
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Deposit/withdrawal {ticket} not found")
+    return json.loads(data)
