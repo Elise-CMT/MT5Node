@@ -128,6 +128,8 @@ class Position(BaseModel):
     notional_value: float
     contract_size: float
     profit_currency: str
+    computed_pnl: float = 0.0
+    computed_swap: float = 0.0
 
 
 class PositionsPayload(BaseModel):
@@ -191,6 +193,10 @@ class ClosedPosition(BaseModel):
     contract_size: float = 0.0
     notional_value: float = 0.0  # volume_lots * contract_size * close_price
     comment: str = ""
+    computed_profit: float = 0.0
+    computed_commission: float = 0.0
+    computed_swap: float = 0.0
+    computed_fee: float = 0.0
 
 
 class ClosedPositionsPayload(BaseModel):
@@ -319,6 +325,10 @@ class Deal(BaseModel):
     time: int
     time_msc: int
     comment: str = ""
+    computed_profit: float = 0.0
+    computed_commission: float = 0.0
+    computed_swap: float = 0.0
+    computed_fee: float = 0.0
 
 
 class DealsPayload(BaseModel):
