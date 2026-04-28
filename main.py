@@ -72,18 +72,49 @@ def _scan_keys(r: redis.Redis, match: str) -> list[str]:
             return keys
 
 
+def _migrate_synced_index(r: redis.Redis, prefix: str, synced_set: str, marker_key: str):
+    """One-shot backfill of `*:months:synced` from existing `*:month:*` keys.
+    Marker-gated so the SCAN runs at most once per Redis instance."""
+    if r.get(marker_key):
+        return
+    keys = _scan_keys(r, f"{prefix}:month:*")
+    months = {k.replace(f"{prefix}:month:", "") for k in keys}
+    if months:
+        r.sadd(synced_set, *months)
+    r.set(marker_key, "1")
+    print(f"[startup] {synced_set}: backfilled {len(months)} months")
+
+
+@app.on_event("startup")
+def migrate_synced_indices():
+    """Populate closed_positions/deals synced indices from any orphan month keys.
+    Runs once per Redis instance (gated by *:synced_migrated marker)."""
+    try:
+        r = get_redis()
+        _migrate_synced_index(r, "closed_positions",
+                              "closed_positions:months:synced",
+                              "closed_positions:synced_migrated")
+        _migrate_synced_index(r, "deals",
+                              "deals:months:synced",
+                              "deals:synced_migrated")
+    except Exception as exc:
+        print(f"[startup] Synced index migration failed: {exc}")
+
+
 @app.on_event("startup")
 def cleanup_legacy_balance_ops_keys():
     """One-shot purge of legacy `balance_op:*` / `balance_ops:*` Redis keys, replaced
-    by the `deposits_withdrawals` feature. Idempotent — does nothing once already clean,
-    so the hook is safe to leave indefinitely."""
+    by the `deposits_withdrawals` feature. Marker-gated so the keyspace SCAN runs at
+    most once per Redis instance."""
     try:
         r = get_redis()
-        keys = _scan_keys(r, "balance_op:*") + _scan_keys(r, "balance_ops:*")
-        if not keys:
+        if r.get("balance_ops:purged"):
             return
-        _delete_keys(r, keys)
-        print(f"[startup] Purged {len(keys)} legacy balance_op(s):* keys")
+        keys = _scan_keys(r, "balance_op:*") + _scan_keys(r, "balance_ops:*")
+        if keys:
+            _delete_keys(r, keys)
+            print(f"[startup] Purged {len(keys)} legacy balance_op(s):* keys")
+        r.set("balance_ops:purged", "1")
     except Exception as exc:
         print(f"[startup] Legacy balance_ops cleanup failed: {exc}")
 
@@ -717,12 +748,17 @@ def _mark_closed_positions_month(r: redis.Redis, month_key: str, count: int, now
 def post_closed_positions(payload: ClosedPositionsPayload):
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
+    months_touched: set[str] = set()
     pipe = r.pipeline()
     pipe.set("closed_positions:last_update", now)
     for cp in payload.closed_positions:
+        mk = _month_key(cp.close_time)
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
-        pipe.sadd(f"closed_positions:month:{_month_key(cp.close_time)}", str(cp.ticket))
+        pipe.sadd(f"closed_positions:month:{mk}", str(cp.ticket))
+        months_touched.add(mk)
+    if months_touched:
+        pipe.sadd("closed_positions:months:synced", *months_touched)
     pipe.execute()
     return {"success": True, "closed_positions_processed": len(payload.closed_positions),
             "tickets": [cp.ticket for cp in payload.closed_positions]}
@@ -732,34 +768,26 @@ def post_closed_positions(payload: ClosedPositionsPayload):
 def closed_positions_months():
     """Return month counts plus explicit sync metadata."""
     r = get_redis()
-    months: dict[str, int] = {}
-    metadata: dict[str, dict] = {}
-
-    for key in _scan_keys(r, "closed_positions:month:*"):
-        month = key.replace("closed_positions:month:", "")
-        months[month] = r.scard(key)
-
-    synced_months = set(r.smembers("closed_positions:months:synced") or set())
-    for month in sorted(synced_months | set(months.keys())):
-        meta = r.hgetall(_month_meta_key(month))
-        if meta:
-            count = int(meta.get("count") or 0)
-            months[month] = count
-            metadata[month] = {
-                "month": month,
-                "count": count,
-                "last_update": meta.get("last_update"),
-                "synced": str(meta.get("synced", "0")) == "1",
-            }
-        else:
-            count = months.get(month, 0)
-            metadata[month] = {
-                "month": month,
-                "count": count,
-                "last_update": None,
-                "synced": True,
-            }
-
+    synced = sorted(r.smembers("closed_positions:months:synced") or set())
+    if not synced:
+        return {"months": {}, "metadata": {}}
+    pipe = r.pipeline()
+    for mk in synced:
+        pipe.hgetall(_month_meta_key(mk))
+        pipe.scard(f"closed_positions:month:{mk}")
+    out = pipe.execute()
+    months, metadata = {}, {}
+    for i, mk in enumerate(synced):
+        meta = out[i * 2] or {}
+        set_count = out[i * 2 + 1] or 0
+        count = int(meta.get("count") or set_count)
+        months[mk] = count
+        metadata[mk] = {
+            "month": mk,
+            "count": count,
+            "last_update": meta.get("last_update"),
+            "synced": str(meta.get("synced", "1")) == "1",
+        }
     return {"months": months, "metadata": metadata}
 
 
@@ -769,11 +797,7 @@ def check_closed_positions_months(from_date: str, to_date: str):
     from_month = _month_key_from_date(_parse_date_param(from_date, "from_date"))
     to_month = _month_key_from_date(_parse_date_param(to_date, "to_date"))
     required_months = _month_range(from_month, to_month)
-
     present = set(r.smembers("closed_positions:months:synced") or set())
-    for key in _scan_keys(r, "closed_positions:month:*"):
-        present.add(key.replace("closed_positions:month:", ""))
-
     present_months = [m for m in required_months if m in present]
     missing_months = [m for m in required_months if m not in present]
     current_month = _month_key_from_date(datetime.now(timezone.utc).date())
@@ -865,15 +889,20 @@ def upsert_closed_positions(payload: ClosedPositionsPayload):
     wm_raw = r.get("closed_positions:watermark")
     current_wm = int(wm_raw) if wm_raw else 0
     max_ts = current_wm
+    months_touched: set[str] = set()
 
     pipe = r.pipeline()
     pipe.set("closed_positions:last_update", now)
     for cp in payload.closed_positions:
+        mk = _month_key(cp.close_time)
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
-        pipe.sadd(f"closed_positions:month:{_month_key(cp.close_time)}", str(cp.ticket))
+        pipe.sadd(f"closed_positions:month:{mk}", str(cp.ticket))
+        months_touched.add(mk)
         if cp.close_time > max_ts:
             max_ts = cp.close_time
+    if months_touched:
+        pipe.sadd("closed_positions:months:synced", *months_touched)
     if max_ts > current_wm:
         pipe.set("closed_positions:watermark", str(max_ts))
     pipe.execute()
@@ -968,12 +997,17 @@ def _deal_snapshot_prefix(month_key: str, snapshot_id: str) -> str:
 def post_deals(payload: DealsPayload):
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
+    months_touched: set[str] = set()
     pipe = r.pipeline()
     pipe.set("deals:last_update", now)
     for deal in payload.deals:
+        mk = _month_key(deal.time)
         pipe.set(f"deal:{deal.ticket}", json.dumps(deal.model_dump()))
         pipe.sadd("deals:tickets", str(deal.ticket))
-        pipe.sadd(f"deals:month:{_month_key(deal.time)}", str(deal.ticket))
+        pipe.sadd(f"deals:month:{mk}", str(deal.ticket))
+        months_touched.add(mk)
+    if months_touched:
+        pipe.sadd("deals:months:synced", *months_touched)
     pipe.execute()
     return {"success": True, "deals_processed": len(payload.deals)}
 
@@ -981,33 +1015,26 @@ def post_deals(payload: DealsPayload):
 @app.get("/deals/months", dependencies=[Security(verify_token)])
 def deal_months():
     r = get_redis()
-    months: dict[str, int] = {}
-    metadata: dict[str, dict] = {}
-
-    for key in _scan_keys(r, "deals:month:*"):
-        month = key.replace("deals:month:", "")
-        months[month] = r.scard(key)
-
-    synced_months = set(r.smembers("deals:months:synced") or set())
-    for month in sorted(synced_months | set(months.keys())):
-        meta = r.hgetall(_deal_month_meta_key(month))
-        if meta:
-            count = int(meta.get("count") or 0)
-            months[month] = count
-            metadata[month] = {
-                "month": month,
-                "count": count,
-                "last_update": meta.get("last_update"),
-                "synced": str(meta.get("synced", "0")) == "1",
-            }
-        else:
-            metadata[month] = {
-                "month": month,
-                "count": months.get(month, 0),
-                "last_update": None,
-                "synced": True,
-            }
-
+    synced = sorted(r.smembers("deals:months:synced") or set())
+    if not synced:
+        return {"months": {}, "metadata": {}}
+    pipe = r.pipeline()
+    for mk in synced:
+        pipe.hgetall(_deal_month_meta_key(mk))
+        pipe.scard(f"deals:month:{mk}")
+    out = pipe.execute()
+    months, metadata = {}, {}
+    for i, mk in enumerate(synced):
+        meta = out[i * 2] or {}
+        set_count = out[i * 2 + 1] or 0
+        count = int(meta.get("count") or set_count)
+        months[mk] = count
+        metadata[mk] = {
+            "month": mk,
+            "count": count,
+            "last_update": meta.get("last_update"),
+            "synced": str(meta.get("synced", "1")) == "1",
+        }
     return {"months": months, "metadata": metadata}
 
 
@@ -1017,11 +1044,7 @@ def check_deal_months(from_date: str, to_date: str):
     from_month = _month_key_from_date(_parse_date_param(from_date, "from_date"))
     to_month = _month_key_from_date(_parse_date_param(to_date, "to_date"))
     required_months = _month_range(from_month, to_month)
-
     present = set(r.smembers("deals:months:synced") or set())
-    for key in _scan_keys(r, "deals:month:*"):
-        present.add(key.replace("deals:month:", ""))
-
     present_months = [m for m in required_months if m in present]
     missing_months = [m for m in required_months if m not in present]
     current_month = _month_key_from_date(datetime.now(timezone.utc).date())
