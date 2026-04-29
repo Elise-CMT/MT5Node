@@ -88,7 +88,12 @@ def _migrate_synced_index(r: redis.Redis, prefix: str, synced_set: str, marker_k
 @app.on_event("startup")
 def migrate_synced_indices():
     """Populate closed_positions/deals synced indices from any orphan month keys.
-    Runs once per Redis instance (gated by *:synced_migrated marker)."""
+    Runs once per Redis instance (gated by *:synced_migrated marker).
+
+    Also backfills the per-month index for deposits_withdrawals from the
+    existing flat tickets SET, since the original feature stored everything
+    flat — without this the first new-CLI cycle would refetch 14 years of
+    data even though it's all already on Redis."""
     try:
         r = get_redis()
         _migrate_synced_index(r, "closed_positions",
@@ -97,8 +102,56 @@ def migrate_synced_indices():
         _migrate_synced_index(r, "deals",
                               "deals:months:synced",
                               "deals:synced_migrated")
+        _migrate_deposits_withdrawals_per_month(r)
     except Exception as exc:
         print(f"[startup] Synced index migration failed: {exc}")
+
+
+def _migrate_deposits_withdrawals_per_month(r: redis.Redis):
+    """Walk deposits_withdrawals:tickets, group by month from each record's
+    `time` field, populate deposits_withdrawals:month:{mk} SETs and
+    deposits_withdrawals:months:synced. One-shot, marker-gated."""
+    if r.get("deposits_withdrawals:migrated"):
+        return
+    tickets = list(r.smembers("deposits_withdrawals:tickets") or set())
+    if not tickets:
+        r.set("deposits_withdrawals:migrated", "1")
+        return
+
+    # Read all records in one pipeline pass.
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deposit_withdrawal:{t}")
+    raw_records = pipe.execute()
+
+    months: dict[str, list[str]] = {}
+    for t, raw in zip(tickets, raw_records):
+        if not raw:
+            continue
+        try:
+            ts = int(json.loads(raw).get("time", 0) or 0)
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        mk = _month_key(ts)
+        months.setdefault(mk, []).append(t)
+
+    wpipe = r.pipeline()
+    for mk, ts_list in months.items():
+        for t in ts_list:
+            wpipe.sadd(f"deposits_withdrawals:month:{mk}", t)
+        wpipe.hset(f"deposits_withdrawals:month_meta:{mk}", mapping={
+            "month": mk,
+            "count": len(ts_list),
+            "last_update": "",
+            "synced": 1,
+        })
+        wpipe.sadd("deposits_withdrawals:months:synced", mk)
+    wpipe.set("deposits_withdrawals:migrated", "1")
+    wpipe.execute()
+    print(f"[startup] D&W: backfilled per-month index across "
+          f"{len(months)} months / {sum(len(v) for v in months.values())} records")
 
 
 @app.on_event("startup")
@@ -125,6 +178,10 @@ def _month_meta_key(month_key: str) -> str:
 
 def _deal_month_meta_key(month_key: str) -> str:
     return f"deals:month_meta:{month_key}"
+
+
+def _dw_month_meta_key(month_key: str) -> str:
+    return f"deposits_withdrawals:month_meta:{month_key}"
 
 
 def _parse_date_param(value: str, name: str) -> date:
@@ -495,6 +552,7 @@ def stats():
     pipe.scard("closed_positions:tickets")
     pipe.scard("rates:symbols")
     pipe.scard("deposits_withdrawals:tickets")
+    pipe.scard("deposits_withdrawals:months:synced")
     pipe.scard("historical_rates:symbols")
     pipe.scard("historical_rates:years_synced")
     pipe.get("positions:last_update")
@@ -504,7 +562,7 @@ def stats():
     pipe.get("rates:last_update")
     pipe.get("deposits_withdrawals:last_update")
     pipe.get("historical_rates:last_update")
-    (pos, acct, deal, cpx, rate, dwc, hr_syms, hr_years,
+    (pos, acct, deal, cpx, rate, dwc, dw_months, hr_syms, hr_years,
      pts, ats, dts, cpts, rts, dwts, hrts) = pipe.execute()
 
     # Total historical-rate record count = sum of per-symbol date sets.
@@ -523,7 +581,8 @@ def stats():
         "deals":                 {"count": deal, "last_update": dts},
         "closed_positions":      {"count": cpx,  "last_update": cpts},
         "rates":                 {"count": rate, "last_update": rts},
-        "deposits_withdrawals":  {"count": dwc,  "last_update": dwts},
+        "deposits_withdrawals":  {"count": dwc,  "months_synced": dw_months,
+                                  "last_update": dwts},
         "historical_rates":      {"count": hr_count, "symbols": hr_syms,
                                   "years_synced": hr_years, "last_update": hrts},
     }
@@ -1333,6 +1392,103 @@ def get_all_deposits_withdrawals():
     rows = sorted([json.loads(d) for d in pipe.execute() if d],
                   key=lambda x: x["time"], reverse=True)
     return {"count": len(rows), "deposits_withdrawals": rows}
+
+
+@app.get("/deposits_withdrawals/months/check", dependencies=[Security(verify_token)])
+def check_deposits_withdrawals_months(from_date: str, to_date: str):
+    """Tells the CLI which calendar months in [from_date, to_date] are not
+    yet on Redis. Single SMEMBERS read against deposits_withdrawals:months:synced —
+    no SCAN."""
+    r = get_redis()
+    from_month = _month_key_from_date(_parse_date_param(from_date, "from_date"))
+    to_month = _month_key_from_date(_parse_date_param(to_date, "to_date"))
+    required_months = _month_range(from_month, to_month)
+    present = set(r.smembers("deposits_withdrawals:months:synced") or set())
+    present_months = [m for m in required_months if m in present]
+    missing_months = [m for m in required_months if m not in present]
+    current_month = _month_key_from_date(datetime.now(timezone.utc).date())
+    return {
+        "ok": not missing_months,
+        "from_month": from_month,
+        "to_month": to_month,
+        "missing_months": missing_months,
+        "present_months": present_months,
+        "current_month": current_month,
+    }
+
+
+@app.get("/deposits_withdrawals/months/synced", dependencies=[Security(verify_token)])
+def deposits_withdrawals_months_synced():
+    r = get_redis()
+    return {"months": sorted(r.smembers("deposits_withdrawals:months:synced") or set())}
+
+
+@app.get("/deposits_withdrawals/months", dependencies=[Security(verify_token)])
+def deposits_withdrawals_months():
+    """Per-month count + last_update meta. Synced-only, pipelined — no SCAN."""
+    r = get_redis()
+    synced = sorted(r.smembers("deposits_withdrawals:months:synced") or set())
+    if not synced:
+        return {"months": {}, "metadata": {}}
+    pipe = r.pipeline()
+    for mk in synced:
+        pipe.hgetall(_dw_month_meta_key(mk))
+        pipe.scard(f"deposits_withdrawals:month:{mk}")
+    out = pipe.execute()
+    months, metadata = {}, {}
+    for i, mk in enumerate(synced):
+        meta = out[i * 2] or {}
+        set_count = out[i * 2 + 1] or 0
+        count = int(meta.get("count") or set_count)
+        months[mk] = count
+        metadata[mk] = {
+            "month": mk,
+            "count": count,
+            "last_update": meta.get("last_update") or None,
+            "synced": str(meta.get("synced", "1")) == "1",
+        }
+    return {"months": months, "metadata": metadata}
+
+
+@app.post("/deposits_withdrawals/month/{year}/{month}", dependencies=[Security(verify_token)])
+def post_deposits_withdrawals_month(year: int, month: int, payload: DepositsWithdrawalsPayload):
+    """Snapshot-replace deposits & withdrawals for a single calendar month.
+    Mirrors post_closed_positions_month: drop existing rows for the month,
+    insert the new batch, mark synced + meta, bump last_update."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    mk = f"{year}-{month:02d}"
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Drop old per-month rows.
+    old_tickets = r.smembers(f"deposits_withdrawals:month:{mk}") or set()
+    pipe = r.pipeline()
+    for t in old_tickets:
+        pipe.delete(f"deposit_withdrawal:{t}")
+        pipe.srem("deposits_withdrawals:tickets", t)
+    pipe.delete(f"deposits_withdrawals:month:{mk}")
+    pipe.execute()
+
+    # Insert new batch.
+    pipe = r.pipeline()
+    pipe.set("deposits_withdrawals:last_update", now)
+    pipe.hset(_dw_month_meta_key(mk), mapping={
+        "month": mk,
+        "count": len(payload.deposits_withdrawals),
+        "last_update": now,
+        "synced": 1,
+    })
+    pipe.sadd("deposits_withdrawals:months:synced", mk)
+    for d in payload.deposits_withdrawals:
+        pipe.set(f"deposit_withdrawal:{d.ticket}", d.model_dump_json())
+        pipe.sadd("deposits_withdrawals:tickets", str(d.ticket))
+        pipe.sadd(f"deposits_withdrawals:month:{mk}", str(d.ticket))
+    pipe.execute()
+
+    return {"success": True, "month": mk,
+            "deposits_withdrawals_processed": len(payload.deposits_withdrawals),
+            "replaced": len(old_tickets)}
 
 
 @app.get("/deposits_withdrawals/{ticket}", dependencies=[Security(verify_token)])
