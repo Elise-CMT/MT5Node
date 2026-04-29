@@ -904,6 +904,25 @@ def check_closed_positions_months(from_date: str, to_date: str):
     }
 
 
+@app.get("/closed_positions/month/{year}/{month}", dependencies=[Security(verify_token)])
+def get_closed_positions_month(year: int, month: int):
+    """Return every closed position whose `close_time` falls in {year}-{month},
+    sorted by close_time ascending. Reads only the per-month SET — no SCAN."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    mk = f"{year}-{month:02d}"
+    r = get_redis()
+    tickets = list(r.smembers(f"closed_positions:month:{mk}") or set())
+    if not tickets:
+        return {"month": mk, "count": 0, "closed_positions": []}
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"closed_position:{t}")
+    rows = sorted([json.loads(d) for d in pipe.execute() if d],
+                  key=lambda x: x.get("close_time", 0))
+    return {"month": mk, "count": len(rows), "closed_positions": rows}
+
+
 @app.post("/closed_positions/month/{year}/{month}", dependencies=[Security(verify_token)])
 def post_closed_positions_month(year: int, month: int, payload: MonthlyClosedPositionsPayload):
     """Snapshot-replace closed positions for a single calendar month."""
@@ -1149,6 +1168,25 @@ def check_deal_months(from_date: str, to_date: str):
         "present_months": present_months,
         "current_month": current_month,
     }
+
+
+@app.get("/deals/month/{year}/{month}", dependencies=[Security(verify_token)])
+def get_deals_month(year: int, month: int):
+    """Return every deal whose `time` falls in {year}-{month}, sorted by time
+    ascending. Reads only the per-month SET — no SCAN."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    mk = f"{year}-{month:02d}"
+    r = get_redis()
+    tickets = list(r.smembers(f"deals:month:{mk}") or set())
+    if not tickets:
+        return {"month": mk, "count": 0, "deals": []}
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deal:{t}")
+    rows = sorted([json.loads(d) for d in pipe.execute() if d],
+                  key=lambda x: x.get("time", 0))
+    return {"month": mk, "count": len(rows), "deals": rows}
 
 
 @app.post("/deals/month/{year}/{month}/snapshot/begin", dependencies=[Security(verify_token)])
@@ -1489,6 +1527,25 @@ def post_deposits_withdrawals_month(year: int, month: int, payload: DepositsWith
     return {"success": True, "month": mk,
             "deposits_withdrawals_processed": len(payload.deposits_withdrawals),
             "replaced": len(old_tickets)}
+
+
+@app.get("/deposits_withdrawals/month/{year}/{month}", dependencies=[Security(verify_token)])
+def get_deposits_withdrawals_month(year: int, month: int):
+    """Return every deposit / withdrawal whose `time` falls in {year}-{month}, sorted
+    by time ascending. Reads only the per-month SET — no SCAN, no global filter."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    mk = f"{year}-{month:02d}"
+    r = get_redis()
+    tickets = list(r.smembers(f"deposits_withdrawals:month:{mk}") or set())
+    if not tickets:
+        return {"month": mk, "count": 0, "deposits_withdrawals": []}
+    pipe = r.pipeline()
+    for t in tickets:
+        pipe.get(f"deposit_withdrawal:{t}")
+    rows = sorted([json.loads(d) for d in pipe.execute() if d],
+                  key=lambda x: x.get("time", 0))
+    return {"month": mk, "count": len(rows), "deposits_withdrawals": rows}
 
 
 @app.get("/deposits_withdrawals/{ticket}", dependencies=[Security(verify_token)])
