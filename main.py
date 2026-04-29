@@ -995,13 +995,16 @@ def closed_positions_watermark():
 
 @app.post("/closed_positions/upsert", dependencies=[Security(verify_token)])
 def upsert_closed_positions(payload: ClosedPositionsPayload):
-    """Upsert closed positions without resetting. Updates close_time watermark."""
+    """Upsert closed positions without resetting. Updates close_time watermark
+    and writes the per-month index, but intentionally does NOT mark months as
+    `synced`. The rolling-window CLI step calls this every cycle for the
+    current month — flipping synced here would short-circuit the
+    historical-missing snapshot-replace flow at month rollover."""
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
     wm_raw = r.get("closed_positions:watermark")
     current_wm = int(wm_raw) if wm_raw else 0
     max_ts = current_wm
-    months_touched: set[str] = set()
 
     pipe = r.pipeline()
     pipe.set("closed_positions:last_update", now)
@@ -1010,11 +1013,8 @@ def upsert_closed_positions(payload: ClosedPositionsPayload):
         pipe.set(f"closed_position:{cp.ticket}", json.dumps(cp.model_dump()))
         pipe.sadd("closed_positions:tickets", str(cp.ticket))
         pipe.sadd(f"closed_positions:month:{mk}", str(cp.ticket))
-        months_touched.add(mk)
         if cp.close_time > max_ts:
             max_ts = cp.close_time
-    if months_touched:
-        pipe.sadd("closed_positions:months:synced", *months_touched)
     if max_ts > current_wm:
         pipe.set("closed_positions:watermark", str(max_ts))
     pipe.execute()
@@ -1486,6 +1486,28 @@ def deposits_withdrawals_months():
             "synced": str(meta.get("synced", "1")) == "1",
         }
     return {"months": months, "metadata": metadata}
+
+
+@app.post("/deposits_withdrawals/upsert", dependencies=[Security(verify_token)])
+def upsert_deposits_withdrawals(payload: DepositsWithdrawalsPayload):
+    """Upsert deposits/withdrawals without snapshot-replacing the month.
+    Used by the rolling-window step on each CLI cycle. Like
+    upsert_closed_positions, it populates the per-month index but does NOT
+    mark months as `synced` — that flip is reserved for the explicit
+    /month/{Y}/{M} snapshot-replace path so historical-missing flow keeps
+    working at month rollover."""
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    pipe = r.pipeline()
+    pipe.set("deposits_withdrawals:last_update", now)
+    for d in payload.deposits_withdrawals:
+        mk = _month_key(d.time)
+        pipe.set(f"deposit_withdrawal:{d.ticket}", d.model_dump_json())
+        pipe.sadd("deposits_withdrawals:tickets", str(d.ticket))
+        pipe.sadd(f"deposits_withdrawals:month:{mk}", str(d.ticket))
+    pipe.execute()
+    return {"success": True,
+            "deposits_withdrawals_processed": len(payload.deposits_withdrawals)}
 
 
 @app.post("/deposits_withdrawals/month/{year}/{month}", dependencies=[Security(verify_token)])
