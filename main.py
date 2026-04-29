@@ -278,6 +278,7 @@ class Account(BaseModel):
     company: str = ""
     comment: str = ""        # raw MT5 Comment field
     crm_id: str = ""         # alias of `comment`, kept for back-compat
+    currency: str = ""       # account deposit currency (resolved from the account's group)
     external_id: str = ""
     status: str = ""
     lead_campaign: str = ""
