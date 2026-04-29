@@ -276,7 +276,8 @@ class Account(BaseModel):
     address: str = ""
     zip_code: str = ""
     company: str = ""
-    crm_id: str = ""
+    comment: str = ""        # raw MT5 Comment field
+    crm_id: str = ""         # alias of `comment`, kept for back-compat
     external_id: str = ""
     status: str = ""
     lead_campaign: str = ""
@@ -455,11 +456,14 @@ class DepositsWithdrawalsPayload(BaseModel):
 
 
 class HistoricalRate(BaseModel):
-    symbol: str
-    date:   str           # YYYY-MM-DD (UTC)
-    bid:    float
-    ask:    float
-    time:   int = 0       # unix seconds of the source bar (optional)
+    symbol:     str
+    date:       str       # YYYY-MM-DD (UTC)
+    open_bid:   float = 0.0
+    open_ask:   float = 0.0
+    time_open:  int   = 0
+    close_bid:  float = 0.0
+    close_ask:  float = 0.0
+    time_close: int   = 0
 
 
 class HistoricalRatesPayload(BaseModel):
@@ -1358,6 +1362,15 @@ def historical_rates_symbols():
     return {"symbols": sorted(r.smembers("historical_rates:symbols") or set())}
 
 
+@app.get("/historical_rates/{symbol}/dates", dependencies=[Security(verify_token)])
+def historical_rates_dates(symbol: str):
+    """Sorted list of YYYY-MM-DD dates this symbol has data for. Used by the
+    MT5-Elise backfill job to skip (symbol, year) combos already present."""
+    r = get_redis()
+    dates = sorted(r.smembers(f"historical_rates:{symbol}:dates") or set())
+    return {"symbol": symbol, "count": len(dates), "dates": dates}
+
+
 @app.post("/historical_rates/year/{year}", dependencies=[Security(verify_token)])
 def post_historical_rates_year(year: int, payload: HistoricalRatesPayload):
     """Snapshot-replace a full calendar year of daily-close rates across all
@@ -1384,6 +1397,17 @@ def post_historical_rates_year(year: int, payload: HistoricalRatesPayload):
     pipe.set("historical_rates:last_update", now)
     pipe.execute()
     return {"success": True, "year": year, "rates_processed": len(payload.rates)}
+
+
+@app.post("/historical_rates/year/{year}/mark_synced", dependencies=[Security(verify_token)])
+def mark_historical_rates_year_synced(year: int):
+    """Flag a calendar year as fully backfilled. MT5-Elise calls this once
+    every requested symbol for the year either has data on file or returned
+    zero bars from MT5, so the year doesn't get re-attempted."""
+    r = get_redis()
+    r.sadd("historical_rates:years_synced", str(year))
+    r.set("historical_rates:last_update", datetime.now(timezone.utc).isoformat())
+    return {"success": True, "year": year}
 
 
 @app.post("/historical_rates/upsert", dependencies=[Security(verify_token)])
