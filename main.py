@@ -454,6 +454,18 @@ class DepositsWithdrawalsPayload(BaseModel):
     deposits_withdrawals: list[DepositWithdrawal]
 
 
+class HistoricalRate(BaseModel):
+    symbol: str
+    date:   str           # YYYY-MM-DD (UTC)
+    bid:    float
+    ask:    float
+    time:   int = 0       # unix seconds of the source bar (optional)
+
+
+class HistoricalRatesPayload(BaseModel):
+    rates: list[HistoricalRate]
+
+
 # =============================================================================
 # Health & Stats
 # =============================================================================
@@ -478,13 +490,28 @@ def stats():
     pipe.scard("closed_positions:tickets")
     pipe.scard("rates:symbols")
     pipe.scard("deposits_withdrawals:tickets")
+    pipe.scard("historical_rates:symbols")
+    pipe.scard("historical_rates:years_synced")
     pipe.get("positions:last_update")
     pipe.get("accounts:last_update")
     pipe.get("deals:last_update")
     pipe.get("closed_positions:last_update")
     pipe.get("rates:last_update")
     pipe.get("deposits_withdrawals:last_update")
-    pos, acct, deal, cpx, rate, dwc, pts, ats, dts, cpts, rts, dwts = pipe.execute()
+    pipe.get("historical_rates:last_update")
+    (pos, acct, deal, cpx, rate, dwc, hr_syms, hr_years,
+     pts, ats, dts, cpts, rts, dwts, hrts) = pipe.execute()
+
+    # Total historical-rate record count = sum of per-symbol date sets.
+    # Cheap because the symbols set is small (~18 entries).
+    hr_count = 0
+    sym_set = r.smembers("historical_rates:symbols") or set()
+    if sym_set:
+        cpipe = r.pipeline()
+        for s in sym_set:
+            cpipe.scard(f"historical_rates:{s}:dates")
+        hr_count = sum(cpipe.execute())
+
     return {
         "positions":             {"count": pos,  "last_update": pts},
         "accounts":              {"count": acct, "last_update": ats},
@@ -492,6 +519,8 @@ def stats():
         "closed_positions":      {"count": cpx,  "last_update": cpts},
         "rates":                 {"count": rate, "last_update": rts},
         "deposits_withdrawals":  {"count": dwc,  "last_update": dwts},
+        "historical_rates":      {"count": hr_count, "symbols": hr_syms,
+                                  "years_synced": hr_years, "last_update": hrts},
     }
 
 
@@ -1308,3 +1337,91 @@ def get_deposit_withdrawal(ticket: int):
     if data is None:
         raise HTTPException(status_code=404, detail=f"Deposit/withdrawal {ticket} not found")
     return json.loads(data)
+
+
+# =============================================================================
+# Historical Rates (daily close per symbol, indexed by symbol + YYYY-MM-DD)
+# =============================================================================
+
+@app.get("/historical_rates/years/synced", dependencies=[Security(verify_token)])
+def historical_rates_years_synced():
+    """Return the set of fully-backfilled calendar years. MT5-Elise reads
+    this to skip years it's already pushed."""
+    r = get_redis()
+    years = sorted(int(y) for y in (r.smembers("historical_rates:years_synced") or set()))
+    return {"years": years}
+
+
+@app.get("/historical_rates/symbols", dependencies=[Security(verify_token)])
+def historical_rates_symbols():
+    r = get_redis()
+    return {"symbols": sorted(r.smembers("historical_rates:symbols") or set())}
+
+
+@app.post("/historical_rates/year/{year}", dependencies=[Security(verify_token)])
+def post_historical_rates_year(year: int, payload: HistoricalRatesPayload):
+    """Snapshot-replace a full calendar year of daily-close rates across all
+    symbols in the payload. Marks the year as synced so subsequent backfill
+    ticks skip it."""
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    year_prefix = f"{year}-"
+
+    # Sweep every existing symbol's date set, drop any date in `year`.
+    pipe = r.pipeline()
+    for sym in (r.smembers("historical_rates:symbols") or set()):
+        existing = r.smembers(f"historical_rates:{sym}:dates") or set()
+        for d in existing:
+            if d.startswith(year_prefix):
+                pipe.delete(f"historical_rate:{sym}:{d}")
+                pipe.srem(f"historical_rates:{sym}:dates", d)
+    # Insert new payload
+    for hr in payload.rates:
+        pipe.set(f"historical_rate:{hr.symbol}:{hr.date}", json.dumps(hr.model_dump()))
+        pipe.sadd(f"historical_rates:{hr.symbol}:dates", hr.date)
+        pipe.sadd("historical_rates:symbols", hr.symbol)
+    pipe.sadd("historical_rates:years_synced", str(year))
+    pipe.set("historical_rates:last_update", now)
+    pipe.execute()
+    return {"success": True, "year": year, "rates_processed": len(payload.rates)}
+
+
+@app.post("/historical_rates/upsert", dependencies=[Security(verify_token)])
+def upsert_historical_rates(payload: HistoricalRatesPayload):
+    """Idempotent upsert — used by the daily forward job. No year-replace,
+    no marker change. Same record overwrites itself if pushed twice."""
+    r = get_redis()
+    now = datetime.now(timezone.utc).isoformat()
+    pipe = r.pipeline()
+    for hr in payload.rates:
+        pipe.set(f"historical_rate:{hr.symbol}:{hr.date}", json.dumps(hr.model_dump()))
+        pipe.sadd(f"historical_rates:{hr.symbol}:dates", hr.date)
+        pipe.sadd("historical_rates:symbols", hr.symbol)
+    pipe.set("historical_rates:last_update", now)
+    pipe.execute()
+    return {"success": True, "rates_processed": len(payload.rates)}
+
+
+@app.get("/historical_rates/{symbol}/{date}", dependencies=[Security(verify_token)])
+def get_historical_rate(symbol: str, date: str):
+    r = get_redis()
+    data = r.get(f"historical_rate:{symbol}:{date}")
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No historical rate for {symbol} on {date}",
+        )
+    return json.loads(data)
+
+
+@app.get("/historical_rates/{symbol}", dependencies=[Security(verify_token)])
+def get_historical_rates_for_symbol(symbol: str):
+    r = get_redis()
+    dates = sorted(r.smembers(f"historical_rates:{symbol}:dates") or set())
+    if not dates:
+        return {"symbol": symbol, "count": 0, "rates": []}
+    pipe = r.pipeline()
+    for d in dates:
+        pipe.get(f"historical_rate:{symbol}:{d}")
+    rates = [json.loads(b) for b in pipe.execute() if b]
+    return {"symbol": symbol, "count": len(rates), "rates": rates}
