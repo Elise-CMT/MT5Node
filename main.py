@@ -1107,9 +1107,14 @@ def _deal_snapshot_prefix(month_key: str, snapshot_id: str) -> str:
 
 @app.post("/deals", dependencies=[Security(verify_token)])
 def post_deals(payload: DealsPayload):
+    """Bulk upsert of deals. Writes per-record JSON, the global tickets SET,
+    and the per-month SET — but does NOT mark months synced. The rolling-
+    window CLI step calls this every cycle for the current month; flipping
+    synced here would short-circuit the historical-missing snapshot-replace
+    flow at month rollover (the only path that should mark months synced
+    is the explicit /deals/month/{Y}/{M}/snapshot/.../commit endpoint)."""
     r = get_redis()
     now = datetime.now(timezone.utc).isoformat()
-    months_touched: set[str] = set()
     pipe = r.pipeline()
     pipe.set("deals:last_update", now)
     for deal in payload.deals:
@@ -1117,9 +1122,6 @@ def post_deals(payload: DealsPayload):
         pipe.set(f"deal:{deal.ticket}", json.dumps(deal.model_dump()))
         pipe.sadd("deals:tickets", str(deal.ticket))
         pipe.sadd(f"deals:month:{mk}", str(deal.ticket))
-        months_touched.add(mk)
-    if months_touched:
-        pipe.sadd("deals:months:synced", *months_touched)
     pipe.execute()
     return {"success": True, "deals_processed": len(payload.deals)}
 
