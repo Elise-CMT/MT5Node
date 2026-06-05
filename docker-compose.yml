@@ -1,0 +1,27 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - mt5node-redis-data:/data
+    # Intentionally NOT published to the host — only MT5Node (same compose
+    # network) reaches it. Keeps this Redis isolated from everything else on the box.
+
+  mt5node:
+    build: .
+    restart: always
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      API_PORT: "8080"
+      # Supplied at deploy time via the .env file written from the API_TOKEN secret.
+      API_TOKEN: ${API_TOKEN}
+    ports:
+      # Exposed directly so the Windows MT5Poller can reach it at http://<host>:8080
+      - "8080:8080"
+
+volumes:
+  mt5node-redis-data:
