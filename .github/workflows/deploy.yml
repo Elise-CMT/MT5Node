@@ -34,11 +34,18 @@ jobs:
             # Write the API token (never committed) for docker-compose interpolation.
             printf 'API_TOKEN=%s\n' "${{ secrets.API_TOKEN }}" > .env
             docker compose up -d --build
-            sleep 5
-            if curl -fsS -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" http://127.0.0.1:8080/health; then
-              echo "Deploy OK"
-            else
-              echo "Deploy FAILED — recent logs:"
-              docker compose logs --tail=80
+            echo "Waiting for MT5Node /health to come up..."
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" http://127.0.0.1:8080/health > /tmp/mt5node_health 2>/dev/null; then
+                echo "Healthy after ${i} attempt(s): $(cat /tmp/mt5node_health)"
+                ok=1
+                break
+              fi
+              sleep 3
+            done
+            if [ "$ok" != "1" ]; then
+              echo "Deploy FAILED — /health not OK after retries; recent logs:"
+              docker compose logs --tail=120
               exit 1
             fi
